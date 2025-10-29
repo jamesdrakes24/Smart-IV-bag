@@ -1,0 +1,173 @@
+// Mega2560 + ST7796S TFT + XPT2046 Touch + BTS7960 (IBT-2) Motor Driver
+// Buttons: LOWER / RAISE (hold-to-move). ROTATION = 3.
+// VIN sense divider (optional): VIN -> 10k -> A0 -> 10k -> GND  (A0 ≈ VIN/2)
+//
+// --- TFT (ST7796S SPI) ---
+// VCC->5V, GND->GND, LED->3.3V
+// SDI(MOSI)->D51, SCK->D52, CS->D22, DC->D24, RST->RESET, SDO(MISO)->NC
+//
+// --- TOUCH (XPT2046 SPI) ---
+// T_DIN->D51, T_CLK->D52, T_DO->D50, T_CS->D28, T_IRQ->NC
+//
+// --- BTS7960 (IBT-2) ---
+// Mega D5 -> RPWM (PWM raise)
+// Mega D6 -> LPWM (PWM lower)
+// Mega D7 -> R_EN
+// Mega D8 -> L_EN
+// Mega 5V -> VCC on BTS7960  |  Mega GND <-> Driver GND <-> Battery −
+// Battery + -> B+   Battery − -> B−   Motor -> M+ / M−
+
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7796S.h>
+#include <XPT2046_Touchscreen.h>
+#include <string.h>
+
+// ---------- Types FIRST ----------
+struct UiButton { int16_t x,y,w,h; const char* label; bool down; };
+
+// ---------- Display / Touch ----------
+#define ROTATION 3
+#define TFT_CS   22
+#define TFT_DC   24
+#define TFT_RST  -1
+#define TOUCH_CS 28
+Adafruit_ST7796S tft(TFT_CS, TFT_DC, TFT_RST);
+XPT2046_Touchscreen ts(TOUCH_CS);
+int16_t W=480, H=320;
+
+// ---- Touch calibration (yours) ----
+const bool  useRawXforX = true;
+const bool  useRawXforY = false;
+const float ax = 0.129797f, bx = -32.12f;
+const float ay = 0.086224f, by =  -5.68f;
+
+// ---- Fast touch sampling ----
+const uint8_t  N  = 3;
+const uint16_t US = 200;
+
+// ---------- Voltage sensing ----------
+#define VOLT_PIN A0
+const float VREF = 5.0f; // ADC ref for A0
+float readVIN() {                 // VIN via A0 10k/10k divider
+  const uint8_t S=8; long s=0; for(uint8_t i=0;i<S;i++) s+=analogRead(VOLT_PIN);
+  float adc=(float)s/S; float vA0=(adc*VREF)/1023.0f; return vA0*2.0f;
+}
+long readVcc_mV() {               // 5V rail via internal 1.1V bandgap
+  ADCSRB &= ~_BV(MUX5);
+  ADMUX  =  _BV(REFS0)|_BV(MUX3)|_BV(MUX2)|_BV(MUX1);
+  delay(2); ADCSRA|=_BV(ADSC); while(ADCSRA&_BV(ADSC)){}
+  uint16_t a=ADC; if(!a) return 0; return (1125300L)/a;
+}
+
+// ---------- BTS7960 pins ----------
+const uint8_t PIN_RPWM = 5;   // RAISE
+const uint8_t PIN_LPWM = 6;   // LOWER
+const uint8_t PIN_REN  = 7;
+const uint8_t PIN_LEN  = 8;
+uint8_t MOTOR_PWM = 200;      // 0..255 speed (bump as needed)
+
+// ---------- UI state ----------
+UiButton bLower, bRaise;
+
+// ---------- Helpers ----------
+static inline int16_t clamp16(int32_t v,int16_t lo,int16_t hi){if(v<lo)return lo; if(v>hi)return hi; return (int16_t)v;}
+
+void drawButton(const UiButton& b,bool pressed){
+  tft.fillRoundRect(b.x,b.y,b.w,b.h,14, pressed?0x07E0:0xFFFF);
+  tft.drawRoundRect(b.x,b.y,b.w,b.h,14, 0x0000);
+  tft.setTextColor(0x0000); tft.setTextSize(2);
+  int16_t tx=b.x+(b.w-(int)strlen(b.label)*12)/2, ty=b.y+(b.h-16)/2;
+  tft.setCursor(tx,ty); tft.print(b.label);
+}
+bool hit(const UiButton& b,int16_t x,int16_t y){
+  const int16_t pad=12; return x>=b.x-pad && x<b.x+b.w+pad && y>=b.y-pad && y<b.y+b.h+pad;
+}
+TS_Point medianRaw(){
+  int16_t xs[5],ys[5];
+  for(uint8_t i=0;i<N;i++){ TS_Point p=ts.getPoint(); xs[i]=p.x; ys[i]=p.y; delayMicroseconds(US); }
+  auto sort=[&](int16_t*a){ for(uint8_t i=0;i<N;i++) for(uint8_t j=i+1;j<N;j++) if(a[j]<a[i]){int16_t t=a[i];a[i]=a[j];a[j]=t;} };
+  sort(xs); sort(ys); return TS_Point(xs[N/2],ys[N/2],0);
+}
+bool readTouch(int16_t &px,int16_t &py){
+  if(!ts.touched()) return false;
+  TS_Point r=medianRaw();
+  int32_t rx = useRawXforX ? r.x : r.y;
+  int32_t ry = useRawXforY ? r.x : r.y;
+  float xf=ax*rx+bx, yf=ay*ry+by;
+  px=clamp16((int32_t)(xf+0.5f),0,W-1); py=clamp16((int32_t)(yf+0.5f),0,H-1);
+  return true;
+}
+
+// ---------- Motor control (EN both HIGH on IBT-2) ----------
+void motorSetup(){
+  pinMode(PIN_RPWM,OUTPUT); pinMode(PIN_LPWM,OUTPUT);
+  pinMode(PIN_REN,OUTPUT);  pinMode(PIN_LEN,OUTPUT);
+  // Keep both enables HIGH
+  digitalWrite(PIN_REN,HIGH);
+  digitalWrite(PIN_LEN,HIGH);
+  analogWrite(PIN_RPWM,0);
+  analogWrite(PIN_LPWM,0);
+}
+void motorStop(){ analogWrite(PIN_RPWM,0); analogWrite(PIN_LPWM,0); /* EN stay HIGH */ }
+void motorRaise(){ analogWrite(PIN_LPWM,0); analogWrite(PIN_RPWM,MOTOR_PWM); }
+void motorLower(){ analogWrite(PIN_RPWM,0); analogWrite(PIN_LPWM,MOTOR_PWM); }
+
+// ---------- UI ----------
+void drawStaticUI(){
+  tft.fillScreen(0x0000);
+  tft.setTextColor(0xFFFF); tft.setTextSize(2);
+  tft.setCursor(10,10); tft.print("V:");
+  const char* nctxt="KG: N/C"; int16_t tw=strlen(nctxt)*12;
+  tft.setCursor(W-10-tw,10); tft.print(nctxt);
+  const int16_t BW=200,BH=110,GAP=30;
+  int16_t y=(H-BH)/2, x1=(W/2)-GAP/2-BW, x2=(W/2)+GAP/2;
+  bLower={x1,y,BW,BH,"LOWER",false};
+  bRaise={x2,y,BW,BH,"RAISE",false};
+  drawButton(bLower,false); drawButton(bRaise,false);
+}
+
+// ---------- Arduino ----------
+void setup(){
+  tft.init(320,480);
+  tft.setRotation(ROTATION);
+  W=tft.width(); H=tft.height();
+  ts.begin();
+  analogReference(DEFAULT);   // AVcc for A0 ADC
+  drawStaticUI();
+  motorSetup();
+}
+
+void loop(){
+  // Auto voltage: VIN if present, else 5V rail
+  static uint32_t tPrev=0;
+  if(millis()-tPrev>=100){
+    tPrev=millis();
+    float vin=readVIN(); bool haveVIN=(vin>1.0f);
+    float vShow = haveVIN ? vin : (readVcc_mV()/1000.0f);
+    const char* tag = haveVIN ? "VIN" : "5V";
+    tft.fillRect(30,8,220,20,0x0000);
+    tft.setCursor(30,10); tft.setTextColor(0xFFFF); tft.setTextSize(2);
+    tft.print(vShow,2); tft.print("V "); tft.print(tag);
+  }
+
+  // Touch + motor (hold-to-move)
+  int16_t x,y;
+  if(readTouch(x,y)){
+    bool hL=hit(bLower,x,y), hR=hit(bRaise,x,y);
+    if(hL && !bLower.down){ bLower.down=true; drawButton(bLower,true); }
+    if(!hL && bLower.down){ bLower.down=false; drawButton(bLower,false); }
+    if(hR && !bRaise.down){ bRaise.down=true; drawButton(bRaise,true); }
+    if(!hR && bRaise.down){ bRaise.down=false; drawButton(bRaise,false); }
+
+    if(hR && !hL) motorRaise();
+    else if(hL && !hR) motorLower();
+    else motorStop();
+
+  }else{
+    if(bLower.down){ bLower.down=false; drawButton(bLower,false); }
+    if(bRaise.down){ bRaise.down=false; drawButton(bRaise,false); }
+    motorStop();
+  }
+}
+
