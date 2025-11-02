@@ -1,6 +1,6 @@
-// Mega2560 + ST7796S TFT + XPT2046 Touch + BTS7960 (IBT-2) Motor Driver
-// Buttons: LOWER / RAISE (hold-to-move). ROTATION = 3.
-// VIN sense divider (optional): VIN -> 10k -> A0 -> 10k -> GND  (A0 ≈ VIN/2)
+// Mega2560 + ST7796S TFT + XPT2046 Touch + BTS7960 (IBT-2)
+// Touch buttons latch motion; physical pushbuttons stop motion when pressed.
+// No extra status text. ROTATION = 3.
 //
 // --- TFT (ST7796S SPI) ---
 // VCC->5V, GND->GND, LED->3.3V
@@ -10,12 +10,15 @@
 // T_DIN->D51, T_CLK->D52, T_DO->D50, T_CS->D28, T_IRQ->NC
 //
 // --- BTS7960 (IBT-2) ---
-// Mega D5 -> RPWM (PWM raise)
-// Mega D6 -> LPWM (PWM lower)
-// Mega D7 -> R_EN
-// Mega D8 -> L_EN
-// Mega 5V -> VCC on BTS7960  |  Mega GND <-> Driver GND <-> Battery −
-// Battery + -> B+   Battery − -> B−   Motor -> M+ / M−
+// D5->RPWM (raise), D6->LPWM (lower), D7->R_EN, D8->L_EN
+// Mega 5V->VCC (driver), GNDs common; 12V on B+/-; motor on M+/M-
+//
+// --- STOP PUSHBUTTONS (NO -> GND) ---
+// RAISE stop: one wire->GND, other->D30  (press = LOW)
+// LOWER stop: one wire->GND, other->D31  (press = LOW)
+//
+// --- Optional VIN sense ---
+// VIN -> 10k -> A0 -> 10k -> GND   (A0 ≈ VIN/2)
 
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -23,8 +26,8 @@
 #include <XPT2046_Touchscreen.h>
 #include <string.h>
 
-// ---------- Types FIRST ----------
-struct UiButton { int16_t x,y,w,h; const char* label; bool down; };
+// ---------- Types ----------
+struct UiButton { int16_t x,y,w,h; const char* label; bool lit; };
 
 // ---------- Display / Touch ----------
 #define ROTATION 3
@@ -42,39 +45,39 @@ const bool  useRawXforY = false;
 const float ax = 0.129797f, bx = -32.12f;
 const float ay = 0.086224f, by =  -5.68f;
 
-// ---- Fast touch sampling ----
+// ---- Touch sampling ----
 const uint8_t  N  = 3;
 const uint16_t US = 200;
 
-// ---------- Voltage sensing ----------
+// ---------- Voltage sensing (optional) ----------
 #define VOLT_PIN A0
-const float VREF = 5.0f; // ADC ref for A0
-float readVIN() {                 // VIN via A0 10k/10k divider
-  const uint8_t S=8; long s=0; for(uint8_t i=0;i<S;i++) s+=analogRead(VOLT_PIN);
-  float adc=(float)s/S; float vA0=(adc*VREF)/1023.0f; return vA0*2.0f;
-}
-long readVcc_mV() {               // 5V rail via internal 1.1V bandgap
-  ADCSRB &= ~_BV(MUX5);
-  ADMUX  =  _BV(REFS0)|_BV(MUX3)|_BV(MUX2)|_BV(MUX1);
-  delay(2); ADCSRA|=_BV(ADSC); while(ADCSRA&_BV(ADSC)){}
-  uint16_t a=ADC; if(!a) return 0; return (1125300L)/a;
-}
+const float VREF = 5.0f;
+float readVIN(){ const uint8_t S=8; long s=0; for(uint8_t i=0;i<S;i++) s+=analogRead(VOLT_PIN);
+  float adc=(float)s/S; float vA0=(adc*VREF)/1023.0f; return vA0*2.0f; }
+long readVcc_mV(){ ADCSRB&=~_BV(MUX5); ADMUX=_BV(REFS0)|_BV(MUX3)|_BV(MUX2)|_BV(MUX1);
+  delay(2); ADCSRA|=_BV(ADSC); while(ADCSRA&_BV(ADSC)){} uint16_t a=ADC; if(!a) return 0; return 1125300L/a; }
 
 // ---------- BTS7960 pins ----------
-const uint8_t PIN_RPWM = 5;   // RAISE
-const uint8_t PIN_LPWM = 6;   // LOWER
-const uint8_t PIN_REN  = 7;
-const uint8_t PIN_LEN  = 8;
-uint8_t MOTOR_PWM = 200;      // 0..255 speed (bump as needed)
+const uint8_t PIN_RPWM=5, PIN_LPWM=6, PIN_REN=7, PIN_LEN=8;
+uint8_t MOTOR_PWM = 200; // 0..255 speed cap
 
-// ---------- UI state ----------
+// ---------- Stop buttons (NO, pressed = LOW) ----------
+const uint8_t PIN_STOP_UP  = 30;   // stops RAISE when pressed
+const uint8_t PIN_STOP_DOWN= 31;   // stops LOWER when pressed
+
+// ---------- UI ----------
 UiButton bLower, bRaise;
 
-// ---------- Helpers ----------
-static inline int16_t clamp16(int32_t v,int16_t lo,int16_t hi){if(v<lo)return lo; if(v>hi)return hi; return (int16_t)v;}
+// ---------- State machine ----------
+enum MoveState { IDLE, MOVING_UP, MOVING_DOWN };
+MoveState state = IDLE;
 
-void drawButton(const UiButton& b,bool pressed){
-  tft.fillRoundRect(b.x,b.y,b.w,b.h,14, pressed?0x07E0:0xFFFF);
+// ---------- Helpers ----------
+static inline int16_t clamp16(int32_t v,int16_t lo,int16_t hi){ if(v<lo)return lo; if(v>hi)return hi; return (int16_t)v; }
+
+void drawButton(const UiButton& b, bool on){
+  uint16_t fill = on ? 0x07E0 : 0xFFFF;   // green when active
+  tft.fillRoundRect(b.x,b.y,b.w,b.h,14, fill);
   tft.drawRoundRect(b.x,b.y,b.w,b.h,14, 0x0000);
   tft.setTextColor(0x0000); tft.setTextSize(2);
   int16_t tx=b.x+(b.w-(int)strlen(b.label)*12)/2, ty=b.y+(b.h-16)/2;
@@ -103,15 +106,12 @@ bool readTouch(int16_t &px,int16_t &py){
 void motorSetup(){
   pinMode(PIN_RPWM,OUTPUT); pinMode(PIN_LPWM,OUTPUT);
   pinMode(PIN_REN,OUTPUT);  pinMode(PIN_LEN,OUTPUT);
-  // Keep both enables HIGH
-  digitalWrite(PIN_REN,HIGH);
-  digitalWrite(PIN_LEN,HIGH);
-  analogWrite(PIN_RPWM,0);
-  analogWrite(PIN_LPWM,0);
+  digitalWrite(PIN_REN,HIGH); digitalWrite(PIN_LEN,HIGH); // enable both sides
+  analogWrite(PIN_RPWM,0);   analogWrite(PIN_LPWM,0);
 }
-void motorStop(){ analogWrite(PIN_RPWM,0); analogWrite(PIN_LPWM,0); /* EN stay HIGH */ }
-void motorRaise(){ analogWrite(PIN_LPWM,0); analogWrite(PIN_RPWM,MOTOR_PWM); }
-void motorLower(){ analogWrite(PIN_RPWM,0); analogWrite(PIN_LPWM,MOTOR_PWM); }
+inline void motorStop(){ analogWrite(PIN_RPWM,0); analogWrite(PIN_LPWM,0); }
+inline void motorUp(){   analogWrite(PIN_LPWM,0); analogWrite(PIN_RPWM,MOTOR_PWM); }
+inline void motorDown(){ analogWrite(PIN_RPWM,0); analogWrite(PIN_LPWM,MOTOR_PWM); }
 
 // ---------- UI ----------
 void drawStaticUI(){
@@ -125,21 +125,27 @@ void drawStaticUI(){
   bLower={x1,y,BW,BH,"LOWER",false};
   bRaise={x2,y,BW,BH,"RAISE",false};
   drawButton(bLower,false); drawButton(bRaise,false);
+
+  // ensure bottom area is blank
+  tft.fillRect(0, H-40, W, 40, 0x0000);
 }
 
 // ---------- Arduino ----------
 void setup(){
-  tft.init(320,480);
-  tft.setRotation(ROTATION);
-  W=tft.width(); H=tft.height();
+  tft.init(320,480); tft.setRotation(ROTATION); W=tft.width(); H=tft.height();
   ts.begin();
-  analogReference(DEFAULT);   // AVcc for A0 ADC
+  analogReference(DEFAULT);
+
+  // Stop buttons as NO with pullups (unpressed HIGH, pressed LOW)
+  pinMode(PIN_STOP_UP,   INPUT_PULLUP);
+  pinMode(PIN_STOP_DOWN, INPUT_PULLUP);
+
   drawStaticUI();
   motorSetup();
 }
 
 void loop(){
-  // Auto voltage: VIN if present, else 5V rail
+  // Voltage (VIN if present, else 5V)
   static uint32_t tPrev=0;
   if(millis()-tPrev>=100){
     tPrev=millis();
@@ -147,27 +153,44 @@ void loop(){
     float vShow = haveVIN ? vin : (readVcc_mV()/1000.0f);
     const char* tag = haveVIN ? "VIN" : "5V";
     tft.fillRect(30,8,220,20,0x0000);
-    tft.setCursor(30,10); tft.setTextColor(0xFFFF); tft.setTextSize(2);
+    tft.setCursor(30,10); tft.setTextSize(2); tft.setTextColor(0xFFFF);
     tft.print(vShow,2); tft.print("V "); tft.print(tag);
   }
 
-  // Touch + motor (hold-to-move)
+  // Read stop buttons (NO): pressed = LOW
+  bool stopUpPressed = (digitalRead(PIN_STOP_UP)   == LOW);
+  bool stopDnPressed = (digitalRead(PIN_STOP_DOWN) == LOW);
+
+  // Safety: if moving and its stop is pressed -> stop & unlatch the button
+  if(state==MOVING_UP && stopUpPressed){
+    state = IDLE; motorStop(); if(bRaise.lit){ bRaise.lit=false; drawButton(bRaise,false); }
+  }
+  if(state==MOVING_DOWN && stopDnPressed){
+    state = IDLE; motorStop(); if(bLower.lit){ bLower.lit=false; drawButton(bLower,false); }
+  }
+
+  // Touch: latch motion on tap (ignore if that direction's stop is currently held)
   int16_t x,y;
   if(readTouch(x,y)){
-    bool hL=hit(bLower,x,y), hR=hit(bRaise,x,y);
-    if(hL && !bLower.down){ bLower.down=true; drawButton(bLower,true); }
-    if(!hL && bLower.down){ bLower.down=false; drawButton(bLower,false); }
-    if(hR && !bRaise.down){ bRaise.down=true; drawButton(bRaise,true); }
-    if(!hR && bRaise.down){ bRaise.down=false; drawButton(bRaise,false); }
+    bool onLower = hit(bLower,x,y);
+    bool onRaise = hit(bRaise,x,y);
 
-    if(hR && !hL) motorRaise();
-    else if(hL && !hR) motorLower();
-    else motorStop();
+    if(onRaise && !bRaise.lit && !stopUpPressed){
+      state = MOVING_UP;
+      bRaise.lit = true;  drawButton(bRaise,true);
+      bLower.lit = false; drawButton(bLower,false);
+    }
+    if(onLower && !bLower.lit && !stopDnPressed){
+      state = MOVING_DOWN;
+      bLower.lit = true;  drawButton(bLower,true);
+      bRaise.lit = false; drawButton(bRaise,false);
+    }
+  }
 
-  }else{
-    if(bLower.down){ bLower.down=false; drawButton(bLower,false); }
-    if(bRaise.down){ bRaise.down=false; drawButton(bRaise,false); }
-    motorStop();
+  // Drive motor per current state (latched)
+  switch(state){
+    case IDLE:        motorStop(); break;
+    case MOVING_UP:   if(!stopUpPressed) motorUp();   else { state=IDLE; motorStop(); bRaise.lit=false; drawButton(bRaise,false); } break;
+    case MOVING_DOWN: if(!stopDnPressed) motorDown(); else { state=IDLE; motorStop(); bLower.lit=false; drawButton(bLower,false); } break;
   }
 }
-
